@@ -1205,10 +1205,11 @@ def aggregate_stability_and_set_weights(stability_results, all_metrics, reverse_
             final_weights_dict[long_name] = row['Final_Weight']
             
     return final_weights_dict, agg_df    
-def calculate_pure_returns(df, characteristics, target='Return_252d', vif_threshold=10):
+# REPLACE this entire function in your code
+def calculate_pure_returns(df, characteristics, target='Return_252d', vif_threshold=5, use_pca=True, pca_variance_threshold=0.95):
     """
     Calculates pure factor returns using a robust cross-sectional regression.
-    This version replaces the original to be more robust.
+    This version uses PCA to handle severe multicollinearity, preventing LinAlgWarning.
     """
     if df.empty or target not in df.columns or df[target].isnull().all():
         return pd.Series(dtype=float, name="PureReturns")
@@ -1217,24 +1218,20 @@ def calculate_pure_returns(df, characteristics, target='Return_252d', vif_thresh
     valid_characteristics = [col for col in characteristics if col in df.columns and pd.api.types.is_numeric_dtype(df[col])]
     X = df[valid_characteristics].copy().replace([np.inf, -np.inf], np.nan)
     
-    # Align data
     valid_indices = y.dropna().index
     X, y = X.loc[valid_indices], y.loc[valid_indices]
     if X.empty or y.empty or len(y) < 20:
         logging.warning(f"Insufficient data for pure returns calculation: {len(y)} samples.")
         return pd.Series(dtype=float, name="PureReturns")
 
-    # --- CORRECTED LOOP ---
     for col in X.columns:
         if X[col].isna().any():
-            # Replace inplace=True with explicit reassignment
             median_val = X[col].median()
             X[col] = X[col].fillna(median_val)
-            
         if X[col].min() >= 0 and X[col].quantile(0.75) > 1000: X[col] = np.log1p(X[col])
         if X[col].var() < 1e-8: X[col] += np.random.normal(0, 1e-4, len(X))
     
-    # Check for multicollinearity
+    # Use a more aggressive VIF check first
     final_characteristics = check_multicollinearity(X, valid_characteristics, vif_threshold)
     if not final_characteristics:
         logging.warning("No valid characteristics left after VIF check.")
@@ -1242,19 +1239,37 @@ def calculate_pure_returns(df, characteristics, target='Return_252d', vif_thresh
     
     X = X[final_characteristics]
     
-    # Robust scaling and regression
     scaler = RobustScaler()
     X_scaled = scaler.fit_transform(X)
+    
     try:
-        model = Ridge(alpha=1.0) # Ridge for regularization
-        model.fit(X_scaled, y)
+        model = Ridge(alpha=1.0, solver='auto') # Use a robust solver
         
+        if use_pca:
+            # --- PCA IMPLEMENTATION ---
+            # Keep enough components to explain 95% of the variance
+            pca = PCA(n_components=pca_variance_threshold)
+            X_pca = pca.fit_transform(X_scaled)
+            
+            # Regress on the uncorrelated principal components
+            model.fit(X_pca, y)
+            
+            # Transform coefficients back to the original feature space for interpretation
+            # This is the key step: model.coef_ are for PCA space, we need them for original features
+            original_space_coefs = pca.inverse_transform(model.coef_.reshape(1, -1))[0]
+            
+        else:
+            # Fallback to the old method if PCA is turned off
+            model.fit(X_scaled, y)
+            original_space_coefs = model.coef_
+
         # Unscale coefficients to be interpretable
         scaler_scale = scaler.scale_
-        scaler_scale[scaler_scale < 1e-8] = 1e-8 # Avoid division by zero
-        unscaled_coefs = model.coef_ / scaler_scale
+        scaler_scale[scaler_scale < 1e-8] = 1e-8
+        unscaled_coefs = original_space_coefs / scaler_scale
         
         return pd.Series(unscaled_coefs, index=final_characteristics, name="PureReturns").clip(lower=-10.0, upper=10.0)
+        
     except Exception as e:
         logging.error(f"Pure returns regression failed: {e}")
         return pd.Series(dtype=float, name="PureReturns")
