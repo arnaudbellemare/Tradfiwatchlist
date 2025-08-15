@@ -537,7 +537,7 @@ def calculate_volatility_adjusted_z_score(prices, period=252, ticker="Unknown", 
 
     # Create an adaptive window that gets longer in low-volatility regimes and shorter in high-volatility ones.
     vol_factor = current_vol / historical_vol if historical_vol > 0 else 1.0
-    adaptive_window = int(min(max(126, period / vol_factor), 504))) # Clamp window between ~6mo and ~2yr
+    adaptive_window = int(min(max(126, period / vol_factor), 504)) # Clamp window between ~6mo and ~2yr
     use_length = min(data_length, adaptive_window)
     logging.info(f"Calculating {metric} for {ticker} with adaptive window {use_length} days (vol_factor: {vol_factor:.2f})")
 
