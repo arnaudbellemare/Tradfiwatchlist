@@ -922,7 +922,82 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
             results_df[col] += np.random.normal(0, 0.01, len(results_df))
     
     return results_df.infer_objects(copy=False), failed_tickers, returns_dict
+def simulate_historical_pure_returns(pure_returns_today):
+    """
+    SIMULATES a history of past Pure Factor Return tables.
+    In a real system, you would load this from a database or CSV.
+    """
+    if pure_returns_today is None:
+        return []
+    
+    historical_data = []
+    for i in range(12): # Simulate 12 past "monthly" runs
+        # Create a noisy, slightly different version for past months
+        noise = np.random.normal(0, 0.5, len(pure_returns_today))
+        drift = (12 - i) / 12 * 0.1 # Make older data slightly different
+        simulated_series = pure_returns_today + noise + drift
+        historical_data.append(simulated_series)
+        
+    historical_data.append(pure_returns_today) # Add today's data
+    return historical_data
 
+
+def analyze_coefficient_stability(historical_data):
+    """
+    Analyzes the stability of factor coefficients over time to find the most robust factors.
+    This is the core of the new strategy.
+    """
+    if not historical_data:
+        return pd.DataFrame()
+
+    # Combine all historical Series into one DataFrame
+    df = pd.concat(historical_data, axis=1)
+    df.columns = [f'run_{i}' for i in range(len(df.columns))]
+    
+    # Calculate stability metrics for each factor
+    stability_metrics = pd.DataFrame(index=df.index)
+    stability_metrics['mean_coeff'] = df.mean(axis=1)
+    stability_metrics['std_coeff'] = df.std(axis=1)
+    
+    # Calculate the percentage of times the coefficient was positive
+    stability_metrics['pct_positive'] = (df > 0).sum(axis=1) / len(df.columns)
+    
+    # Calculate the Sharpe Ratio of the coefficient (our "Stability Score")
+    # This is the signal-to-noise ratio of the factor itself.
+    # Use a small epsilon to avoid division by zero for perfectly stable (but useless) factors.
+    stability_metrics['sharpe_ratio_coeff'] = stability_metrics['mean_coeff'] / (stability_metrics['std_coeff'] + 1e-6)
+    
+    return stability_metrics.sort_values(by='sharpe_ratio_coeff', key=abs, ascending=False)
+
+
+def set_weights_from_stability(stability_df, all_metrics, reverse_metric_map):
+    """
+    Sets final portfolio weights based on the factor's stability (Coefficient Sharpe Ratio).
+    """
+    if stability_df.empty or 'sharpe_ratio_coeff' not in stability_df.columns:
+        return {metric: 0.0 for metric in all_metrics}, pd.DataFrame()
+
+    # The weight is directly proportional to the absolute value of the stability score
+    scores = stability_df['sharpe_ratio_coeff'].abs()
+    
+    # Normalize scores to sum to 100
+    total_score = scores.sum()
+    if total_score == 0:
+        return {metric: 0.0 for metric in all_metrics}, stability_df
+
+    final_weights = (scores / total_score) * 100
+    
+    # Build final dictionary
+    final_weights_dict = {metric: 0.0 for metric in all_metrics}
+    for short_name, weight in final_weights.items():
+        long_name = METRIC_NAME_MAP.get(short_name, short_name)
+        if long_name in final_weights_dict:
+            final_weights_dict[long_name] = weight
+            
+    stability_df['Final_Weight'] = final_weights
+    stability_df.fillna(0, inplace=True)
+    
+    return final_weights_dict, stability_df
 def calculate_volatility_adjusted_z_score(prices, period=252, ticker="Unknown", metric="Z-score", sector=None):
     if prices.empty or prices.isna().any() or (prices <= 0).any():
         logging.error(f"Invalid price data for {metric} calculation (Ticker: {ticker}): empty, contains NaN, or non-positive values")
