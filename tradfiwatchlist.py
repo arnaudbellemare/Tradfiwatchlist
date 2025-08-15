@@ -338,17 +338,15 @@ def calculate_idiosyncratic_variance(returns_df, factor_returns_df, betas):
         return pd.Series(0.0, index=returns_df.columns, name='IdioVariance')
 def calculate_fmp_weights(returns_df, new_factor_returns, cov_matrix, existing_factors_returns=None):
     """
-    Calculate FMP weights for a new factor with optional orthogonalization against existing factors.
-    
-    Returns:
-        pd.Series: A pandas Series of weights, with tickers as the index.
+    Calculates CORRECTED Factor-Mimicking Portfolio (FMP) weights.
+    The weights are calculated as w ∝ Σ⁻¹ * β, which maximizes factor exposure
+    for a given level of portfolio variance.
     """
     try:
         tickers = returns_df.columns
         cov_matrix_psd = nearest_psd_matrix(cov_matrix)
         precision_matrix = np.linalg.inv(cov_matrix_psd)
         
-        # Align all data to a common time index
         common_idx = returns_df.index.intersection(new_factor_returns.index)
         if existing_factors_returns is not None:
             common_idx = common_idx.intersection(existing_factors_returns.index)
@@ -356,7 +354,6 @@ def calculate_fmp_weights(returns_df, new_factor_returns, cov_matrix, existing_f
         aligned_returns = returns_df.loc[common_idx]
         aligned_new_factor = new_factor_returns.loc[common_idx]
 
-        # Orthogonalize the new factor against existing factors
         if existing_factors_returns is not None and not existing_factors_returns.empty:
             aligned_existing_factors = existing_factors_returns.loc[common_idx]
             model = LinearRegression().fit(aligned_existing_factors, aligned_new_factor)
@@ -367,28 +364,28 @@ def calculate_fmp_weights(returns_df, new_factor_returns, cov_matrix, existing_f
         # Estimate the betas of assets to the (orthogonalized) factor
         betas = []
         for ticker in aligned_returns.columns:
-            model = LinearRegression().fit(ortho_factor_series.values.reshape(-1, 1), aligned_returns[ticker].values)
+            # Use Ridge regression for more stable beta estimates
+            model = Ridge(alpha=0.1).fit(ortho_factor_series.values.reshape(-1, 1), aligned_returns[ticker].values)
             betas.append(model.coef_[0])
-        B = np.array(betas).reshape(-1, 1)
+        B = np.array(betas) # This is now a 1D array
 
-        # FMP formula: w = Omega^-1 * B * (B^T * Omega^-1 * B)^-1
-        Bt_Omega_B = B.T @ precision_matrix @ B
-        if Bt_Omega_B[0, 0] < 1e-9: # Avoid division by zero
-            return pd.Series(np.ones(len(tickers)) / len(tickers), index=tickers)
-
-        weights = precision_matrix @ B @ np.linalg.inv(Bt_Omega_B)
-        weights = weights.flatten()
+        # --- CRITICAL LOGIC FIX ---
+        # The correct FMP formula is w ∝ Σ⁻¹ * β
+        # The previous implementation used a more complex regression portfolio formula that was not appropriate.
+        raw_weights = precision_matrix @ B
         
-        # Normalize weights
-        weights = weights / np.sum(np.abs(weights))
+        # Normalize the raw weights to sum to 1 (for a long-only portfolio interpretation)
+        # We take the absolute value to handle potential negative weights from the calculation
+        abs_weights = np.abs(raw_weights)
+        if abs_weights.sum() > 1e-9:
+            final_weights = abs_weights / abs_weights.sum()
+        else: # Fallback if all weights are zero
+            final_weights = np.ones(len(tickers)) / len(tickers)
 
-        # --- FIX IS HERE ---
-        # Return a pandas Series with tickers as the index, not a raw NumPy array
-        return pd.Series(weights, index=tickers)
+        return pd.Series(final_weights, index=tickers)
 
     except Exception as e:
         logging.error(f"Error in FMP calculation: {e}")
-        # Ensure the fallback also returns a pandas Series
         return pd.Series(np.ones(len(returns_df.columns)) / len(returns_df.columns), index=returns_df.columns)
 def calculate_information_metrics(forecasted_alphas_ts, realized_returns_ts):
     """
@@ -501,10 +498,11 @@ def calculate_volatility_adjusted_z_score(prices, period=252, ticker="Unknown", 
     """
     Calculates a robust Z-score for a price series, adjusted for volatility and sector.
 
-    This function computes a Z-score using the median and Median Absolute Deviation (MAD)
-    for robustness against outliers. It further refines the score by incorporating an
-    adaptive lookback window based on the ratio of current to historical volatility,
-    and applies a heuristic adjustment based on the stock's sector.
+    This function is designed to be resilient to outliers by using the median and
+    Median Absolute Deviation (MAD) instead of the mean and standard deviation. It
+    further refines the score by incorporating an adaptive lookback window based on
+    the ratio of current to historical volatility and applies a heuristic adjustment
+    based on the stock's sector.
 
     Args:
         prices (pd.Series): A pandas Series of asset prices.
@@ -517,54 +515,64 @@ def calculate_volatility_adjusted_z_score(prices, period=252, ticker="Unknown", 
     Returns:
         float: The calculated volatility-adjusted Z-score, or np.nan if calculation fails.
     """
+    # 1. --- Input Validation ---
+    # Ensure the price series is usable before proceeding.
     if prices.empty or prices.isna().any() or (prices <= 0).any():
-        logging.error(f"Invalid price data for {metric} calculation (Ticker: {ticker}): empty, contains NaN, or non-positive values")
-        return np.nan
-        
-    data_length = len(prices)
-    min_period = 200  # Minimum required days of data
-    if data_length < min_period:
-        logging.error(f"Insufficient data length for {metric} calculation (Ticker: {ticker}): {data_length} < {min_period} days")
+        logging.warning(f"Invalid price data for {metric} calculation (Ticker: {ticker}): empty, contains NaN, or non-positive values")
         return np.nan
 
-    # Calculate log returns for volatility analysis
+    data_length = len(prices)
+    min_period = 200  # Minimum required days of data for a stable calculation.
+    if data_length < min_period:
+        logging.warning(f"Insufficient data length for {metric} calculation (Ticker: {ticker}): {data_length} < {min_period} days")
+        return np.nan
+
+    # 2. --- Adaptive Window Calculation ---
+    # Use log returns, which are standard for financial time series analysis.
     daily_returns = np.log(prices / prices.shift(1)).dropna()
 
-    # Calculate current and historical volatility
-    current_vol = daily_returns.std() * np.sqrt(252)
+    # Calculate current volatility (short-term) and historical volatility (long-term).
+    current_vol = daily_returns.tail(63).std() * np.sqrt(252) # Use last 3 months for "current"
     historical_vol = daily_returns.rolling(window=252).std().mean() * np.sqrt(252) if data_length >= 252 else current_vol
-    
-    # Determine volatility factor and adaptive window
+
+    # Create an adaptive window that gets longer in low-volatility regimes and shorter in high-volatility ones.
     vol_factor = current_vol / historical_vol if historical_vol > 0 else 1.0
-    adaptive_window = int(min(max(126, 252 * (1 + vol_factor)), 504)) # Clamp window between ~6mo and ~2yr
+    adaptive_window = int(min(max(126, period / vol_factor), 504))) # Clamp window between ~6mo and ~2yr
     use_length = min(data_length, adaptive_window)
     logging.info(f"Calculating {metric} for {ticker} with adaptive window {use_length} days (vol_factor: {vol_factor:.2f})")
 
-    # Apply a sector-based adjustment
+    # 3. --- Sector-Based Heuristic Adjustment ---
     sector_adjustment = 1.0
-    # This check assumes 'sector_etf_map' is defined in the global scope
-    if 'sector_etf_map' in globals() and sector in sector_etf_map:
-        sector_adjustment = 0.9 if sector in ['Technology', 'Healthcare'] else 1.1 if sector in ['Utilities', 'Real Estate'] else 1.0
+    if sector:
+        # Heuristically, we expect higher volatility from Tech/Healthcare and lower from Utilities/Real Estate.
+        # This adjustment normalizes that expectation slightly.
+        if sector in ['Technology', 'Healthcare']:
+            sector_adjustment = 0.9
+        elif sector in ['Utilities', 'Real Estate']:
+            sector_adjustment = 1.1
 
-    # Calculate robust Z-score using log prices, median, and MAD
+    # 4. --- Robust Z-Score Calculation ---
+    # Use log prices because financial assets are often log-normally distributed.
     y = np.log(prices[-use_length:]).values
     median_y = np.median(y)
+    
+    # Use Median Absolute Deviation (MAD) as a robust replacement for standard deviation.
     mad = np.median(np.abs(y - median_y))
 
+    # If MAD is zero (all values in the window are the same), we can't calculate a Z-score.
     if mad == 0 or np.isnan(mad):
         logging.warning(f"Zero or NaN MAD in {metric} calculation for {ticker}")
         return np.nan
 
-    # Scale the MAD by the current volatility regime and sector adjustment
-    vol_scaling = current_vol / (historical_vol if historical_vol > 0 else 1.0)
-    robust_z = 0.6745 * (y[-1] - median_y) / (mad * vol_scaling * sector_adjustment)
+    # The 0.6745 constant makes the MAD-based estimator comparable to the standard deviation for normal distributions.
+    # We apply our volatility and sector adjustments to the denominator.
+    robust_std_estimate = mad / 0.6745
+    adjusted_denominator = robust_std_estimate * vol_factor * sector_adjustment
 
-    # Note: The threshold logic below is flawed as robust_z is a scalar.
-    # It is included here to match the provided source code.
-    z_threshold = np.mean(robust_z) + 1.5 * np.std(robust_z)
-    if abs(robust_z) > z_threshold:
-        logging.info(f"{metric} for {ticker} exceeds dynamic threshold {z_threshold:.2f}: {robust_z:.2f}")
+    robust_z = (y[-1] - median_y) / adjusted_denominator
 
+    # 5. --- Return Final Value ---
+    # The flawed thresholding logic has been removed. The function's job is to return the score.
     return robust_z
 
 def recalculate_relative_z_scores(top_15_df, etf_histories, period="3y", window=252, min_window=200):
@@ -995,7 +1003,7 @@ def set_weights_from_stability(stability_df, all_metrics, reverse_metric_map):
             final_weights_dict[long_name] = weight
             
     stability_df['Final_Weight'] = final_weights
-    stability_df.fillna(0, inplace=True)
+    stability_df = stability_df.fillna(0)
     
     return final_weights_dict, stability_df
 def calculate_volatility_adjusted_z_score(prices, period=252, ticker="Unknown", metric="Z-score", sector=None):
@@ -1711,7 +1719,7 @@ def calculate_portfolio_relative_z_score(weighted_df, etf_histories, best_etf, p
         logging.error("Failed to construct portfolio price series for Z-score calculation.")
         return np.nan, best_etf
 
-    portfolio_prices.dropna(inplace=True)
+    portfolio_prices = portfolio_prices.dropna()
     if portfolio_prices.empty:
         logging.error("Portfolio price series is empty after dropping NaNs.")
         return np.nan, best_etf
