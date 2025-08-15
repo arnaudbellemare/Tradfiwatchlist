@@ -1068,6 +1068,68 @@ def calculate_portfolio_factor_correlations(weighted_df, etf_histories, period="
                 correlations['SPY'] = 0.5
     
     return correlations.sort_values(ascending=False)
+# --- This is the NEW function to add/replace the old one ---
+def aggregate_stability_and_set_weights(stability_results, all_metrics, reverse_metric_map):
+    """
+    Aggregates stability metrics from multiple time horizons and sets final portfolio weights.
+    Weights are based on a combination of average signal strength (sharpe ratio) and consistency across horizons.
+    """
+    if not stability_results:
+        return {metric: 0.0 for metric in all_metrics}, pd.DataFrame()
+
+    # Consolidate all factors from all horizons
+    all_factors = set()
+    for horizon, df in stability_results.items():
+        all_factors.update(df.index)
+
+    # Create the aggregated rationale DataFrame
+    agg_df = pd.DataFrame(index=list(all_factors))
+    agg_df['avg_sharpe_coeff'] = 0.0
+    agg_df['consistency_score'] = 0.0 # How often the sign matches the average sign
+    agg_df['horizons_present'] = 0
+
+    # Aggregate metrics for each factor
+    for factor in agg_df.index:
+        sharpes = []
+        for horizon, df in stability_results.items():
+            if factor in df.index:
+                sharpes.append(df.loc[factor, 'sharpe_ratio_coeff'])
+        
+        if not sharpes:
+            continue
+            
+        avg_sharpe = np.mean(sharpes)
+        agg_df.loc[factor, 'avg_sharpe_coeff'] = avg_sharpe
+        agg_df.loc[factor, 'horizons_present'] = len(sharpes)
+
+        # Calculate consistency: % of times the sharpe had the same sign as the average
+        if avg_sharpe != 0:
+            sign_of_avg = np.sign(avg_sharpe)
+            same_sign_count = sum(1 for s in sharpes if np.sign(s) == sign_of_avg)
+            agg_df.loc[factor, 'consistency_score'] = same_sign_count / len(sharpes)
+        else:
+            agg_df.loc[factor, 'consistency_score'] = 0.0
+
+    # Calculate final score: reward both magnitude and consistency
+    # We use a power on consistency to heavily reward factors that work across all horizons
+    agg_df['Final_Score'] = agg_df['avg_sharpe_coeff'].abs() * (agg_df['consistency_score'] ** 2)
+    agg_df = agg_df.sort_values('Final_Score', ascending=False).fillna(0)
+    
+    # Normalize scores to get final weights
+    total_score = agg_df['Final_Score'].sum()
+    if total_score > 0:
+        agg_df['Final_Weight'] = (agg_df['Final_Score'] / total_score) * 100
+    else:
+        agg_df['Final_Weight'] = 0.0
+
+    # Build the final dictionary for all possible metrics
+    final_weights_dict = {metric: 0.0 for metric in all_metrics}
+    for short_name, row in agg_df.iterrows():
+        long_name = METRIC_NAME_MAP.get(short_name, short_name)
+        if long_name in final_weights_dict:
+            final_weights_dict[long_name] = row['Final_Weight']
+            
+    return final_weights_dict, agg_df    
 def calculate_pure_returns(df, characteristics, target='Return_252d', vif_threshold=10):
     """
     Calculates pure factor returns using a robust cross-sectional regression.
@@ -1911,63 +1973,79 @@ def main():
     if failed_tickers:
         st.expander("Show Failed Tickers").warning(f"{len(failed_tickers)} tickers failed: {', '.join(failed_tickers)}")
 
-    # --- Factor Analysis and Weighting ---
-    with st.spinner("Analyzing factor correlations and pure returns..."):
-        results_df, correlation_results, factor_rankings = analyze_factor_correlations(results_df, returns_dict)
+    # --- NEW: AUTOMATIC WEIGHTING BASED ON MULTI-HORIZON COEFFICIENT STABILITY ---
+    st.sidebar.subheader("Automatic Factor Weighting")
+    with st.spinner("Analyzing factor stability across multiple time horizons..."):
+        # 1. Define the time horizons to test
+        time_horizons = {
+            "1M": "Return_21d",
+            "3M": "Return_63d",
+            "6M": "Return_126d",
+            "12M": "Return_252d",
+        }
+        
         valid_metric_cols = [c for c in results_df.columns if pd.api.types.is_numeric_dtype(results_df[c]) and 'Return' not in c and c not in ['Ticker', 'Name', 'Score']]
-        pure_returns = calculate_pure_returns(results_df, valid_metric_cols, target='Return_252d')
+        stability_results = {}
 
-    # THE BAD LINE THAT CREATED THE EMPTY COLUMN IS NOW REMOVED.
+        # 2. Loop through each horizon, calculate pure returns, simulate history, and analyze stability
+        for horizon_label, target_column in time_horizons.items():
+            if target_column in results_df.columns:
+                pure_returns_today = calculate_pure_returns(results_df, valid_metric_cols, target=target_column)
+                if not pure_returns_today.empty:
+                    historical_pure_returns = simulate_historical_pure_returns(pure_returns_today)
+                    stability_df = analyze_coefficient_stability(historical_pure_returns)
+                    stability_results[horizon_label] = stability_df
+        
+        # 3. Aggregate the stability results from all horizons to find the most consistent factors
+        all_possible_metrics = list(default_weights.keys())
+        auto_weights, rationale_df = aggregate_stability_and_set_weights(
+            stability_results, all_possible_metrics, REVERSE_METRIC_NAME_MAP
+        )
 
-    with st.spinner("Calculating ideal metric weights..."):
-        ideal_weights, _, _ = calculate_ideal_weights(factor_rankings, etf_histories, results_df, pure_returns)
-
-    user_weights = {}
-    with st.sidebar.expander("Adjust Metric Weights", expanded=False):
-        for metric in sorted(ideal_weights.keys()):
-            user_weights[metric] = st.slider(f"{metric}", 0.0, 20.0, ideal_weights.get(metric, 1.0), 0.5, key=f"weight_{metric}")
+    with st.sidebar.expander("View Factor Stability Rationale", expanded=True):
+        st.write("Weights are driven by a factor's **average performance** and **consistency** across 1, 3, 6, and 12-month return horizons. Higher scores are better.")
+        st.dataframe(
+            rationale_df[['avg_sharpe_coeff', 'consistency_score', 'horizons_present', 'Final_Weight']].loc[rationale_df['Final_Weight'] > 0.1].sort_values('Final_Weight', ascending=False),
+            column_config={
+                "avg_sharpe_coeff": st.column_config.NumberColumn("Avg Sharpe", help="Average signal-to-noise ratio of the factor's coefficient."),
+                "consistency_score": st.column_config.ProgressColumn("Consistency", help="How consistently the factor's signal had the same sign across all horizons.", format="%.2f", min_value=0, max_value=1),
+                "horizons_present": st.column_config.NumberColumn("Present In", help="Number of time horizons where this factor was significant."),
+                "Final_Weight": st.column_config.NumberColumn("Weight %", format="%.2f")
+            }
+        )
+        
+    user_weights = auto_weights
+    # --- END OF AUTOMATION BLOCK ---
 
     # --- Scoring Block ---
     raw_score = pd.Series(0.0, index=results_df.index)
-    lower_is_better = ['Debt_Ratio', 'PE_Ratio', 'GARCH_Vol']
     for long_name, weight in user_weights.items():
-        short_name = REVERSE_METRIC_NAME_MAP.get(long_name)
-        if short_name in results_df.columns:
-            rank_series = results_df[short_name].rank(pct=True)
-            if short_name in lower_is_better:
-                rank_series = 1 - rank_series
-            raw_score += rank_series.fillna(0.5) * weight
+        if weight > 0:
+            short_name = REVERSE_METRIC_NAME_MAP.get(long_name)
+            if short_name in results_df.columns and short_name in rationale_df.index:
+                rank_series = results_df[short_name].rank(pct=True)
+                
+                # *** CRITICAL FIX ***
+                # Use the SIGN of the AGGREGATED sharpe coefficient to determine if lower is better
+                if rationale_df.loc[short_name, 'avg_sharpe_coeff'] < 0:
+                    rank_series = 1 - rank_series # Invert the rank for factors that are better when low (e.g., P/E ratio)
+                
+                raw_score += rank_series.fillna(0.5) * weight
 
     def z_score(series): return (series - series.mean()) / (series.std() if series.std() > 0 else 1)
     results_df['Score'] = z_score(raw_score)
     top_15_df = results_df.sort_values('Score', ascending=False).head(15).copy()
     top_15_tickers = top_15_df['Ticker'].tolist()
 
-    # --- Synthetic Factor Creation ---
-    st.sidebar.info("The 'Vision' factor is created synthetically.")
-    try:
-        vision_scores = results_df.set_index('Ticker')['Vision'].dropna()
-        if not vision_scores.empty and vision_scores.abs().sum() > 0:
-            vision_weights = vision_scores / vision_scores.abs().sum()
-            full_returns_df = pd.DataFrame(returns_dict).pct_change().dropna(how='all')
-            aligned_weights = vision_weights.reindex(full_returns_df.columns).fillna(0)
-            synth_returns = (full_returns_df * aligned_weights).sum(axis=1)
-            etf_histories['VISION_SYNTHETIC'] = pd.DataFrame({'Close': (1 + synth_returns).cumprod()})
-    except Exception as e:
-        logging.error(f"Failed to create synthetic 'Vision' factor: {e}")
-
-    # --- Portfolio Overview Section ---
-# --- Portfolio Overview Section ---
+    # --- The rest of the main function remains unchanged ---
+    
     st.header("📈 Portfolio Overview")
     if not top_15_tickers:
         st.warning("No stocks for portfolio construction.")
         st.stop()
 
     portfolio_returns_df = pd.DataFrame(returns_dict).reindex(columns=top_15_tickers).dropna(how='all')
-
-# CORRECTED FUNCTION CALL HERE:
     _, cov_matrix = calculate_correlation_matrix(top_15_tickers, returns_dict, window=corr_window)
-
     cov_matrix = cov_matrix.loc[top_15_tickers, top_15_tickers]
 
     momentum_factor_returns = etf_histories['MTUM']['Close'].pct_change().dropna()
@@ -1992,14 +2070,9 @@ def main():
             factor_ts = etf_histories[key]['Close'].pct_change().dropna()
             p_weights = calculate_fmp_weights(aligned_returns, factor_ts, cov_matrix, existing_factors_returns=aligned_momentum.to_frame())
             
-            # Convert series to a DataFrame
             weights_df = p_weights.reset_index()
             weights_df.columns = ['Ticker', 'FMP Weight']
-            
-            # Merge with top_15_df to get the 'Name'
             weights_df = pd.merge(weights_df, top_15_df[['Ticker', 'Name']], on='Ticker', how='left')
-            
-            # Reorder columns and display
             display_cols = ['Ticker', 'Name', 'FMP Weight']
             st.dataframe(
                 weights_df.sort_values("FMP Weight", key=abs, ascending=False)[display_cols],
@@ -2011,8 +2084,15 @@ def main():
         if weighting_method_ui == "Factor-Mimicking (Momentum)": p_weights = calculate_weights(aligned_returns, method="fmp", cov_matrix=cov_matrix, factor_returns=aligned_momentum)
         elif weighting_method_ui == "Alpha Orthogonal": p_weights = calculate_weights(aligned_returns, method="alpha_orthogonal", betas=betas)
         else: p_weights = calculate_weights(aligned_returns, method=method_map.get(weighting_method_ui, "equal"), cov_matrix=cov_matrix)
-        weights_df = pd.DataFrame({"Ticker": top_15_tickers, "Weight": p_weights}).sort_values("Weight", ascending=False)
-        st.dataframe(weights_df)
+        
+        weights_df = p_weights.reset_index()
+        weights_df.columns = ['Ticker', 'Weight']
+        weights_df = pd.merge(weights_df, top_15_df[['Ticker', 'Name']], on='Ticker', how='left')
+        display_cols = ['Ticker', 'Name', 'Weight']
+        st.dataframe(
+            weights_df.sort_values("Weight", ascending=False)[display_cols],
+            use_container_width=True
+        )
 
     weighted_df_calc = pd.DataFrame()
     if 'weights_df' in locals():
@@ -2059,12 +2139,20 @@ def main():
             display_stock_dashboard(selected_ticker, results_df, returns_dict, etf_histories)
             display_deep_dive_data(selected_ticker)
     with tab2:
-        st.subheader("Pure Factor Returns (Cross-Sectional Regression)")
-        if not pure_returns.empty: 
-            st.dataframe(pure_returns.rename("Coefficient").reset_index().rename(columns={'index': 'Factor'}))
+        st.subheader("Pure Factor Returns (Aggregated & Individual Horizons)")
+        # Display the main aggregated rationale first
+        st.write("#### Aggregated Factor Performance")
+        st.dataframe(rationale_df)
+        
+        # Then allow drilling down into individual horizons
+        for horizon_label, stability_df in stability_results.items():
+             with st.expander(f"Details for {horizon_label} Horizon (Target: {time_horizons[horizon_label]})"):
+                 if not stability_df.empty:
+                     st.dataframe(stability_df)
+                 else:
+                     st.warning(f"No significant factors found for the {horizon_label} horizon.")
     with tab3:
         st.subheader("Full Processed Data Table")
         st.dataframe(results_df)
-
 if __name__ == "__main__":
     main()
